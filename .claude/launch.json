@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "mockup-preview",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["mockup/serve.js"],
+      "port": 5179
+    }
+  ]
+}
