@@ -1,6 +1,6 @@
 import { BleManager, Device, Subscription } from 'react-native-ble-plx';
 import { Buffer } from 'buffer';
-import { OBD_BLE_UUIDS } from './uuids';
+import { discoverUartChannel, UartChannel } from './discovery';
 import { requestBlePermissions } from './permissions';
 import { ScannedDevice } from '../types/ble';
 import { INIT_COMMANDS } from '../obd/elm327';
@@ -11,11 +11,14 @@ const COMMAND_TIMEOUT_MS = 5000;
 /**
  * Talks to any ELM327-compatible OBDII adapter over BLE. One command is
  * in flight at a time — the adapter is a simple request/response serial
- * device under the hood, it doesn't pipeline.
+ * device under the hood, it doesn't pipeline. The GATT service/characteristic
+ * pair isn't assumed — it's discovered per-device on connect, since ELM327
+ * BLE clones don't agree on a single standard profile.
  */
 export class BleService {
   private manager = new BleManager();
   private device: Device | null = null;
+  private channel: UartChannel | null = null;
   private notifySub: Subscription | null = null;
   private responseBuffer = '';
   private pending: { resolve: (v: string) => void; reject: (e: Error) => void } | null = null;
@@ -43,12 +46,21 @@ export class BleService {
   async connect(deviceId: string): Promise<void> {
     this.manager.stopDeviceScan();
     const device = await this.manager.connectToDevice(deviceId, { timeout: 10000 });
-    await device.discoverAllServicesAndCharacteristics();
+
+    let channel: UartChannel;
+    try {
+      channel = await discoverUartChannel(device);
+    } catch (err) {
+      await this.manager.cancelDeviceConnection(device.id).catch(() => undefined);
+      throw err;
+    }
+
     this.device = device;
+    this.channel = channel;
 
     this.notifySub = device.monitorCharacteristicForService(
-      OBD_BLE_UUIDS.service,
-      OBD_BLE_UUIDS.notifyCharacteristic,
+      channel.serviceUUID,
+      channel.notifyCharacteristicUUID,
       (error, characteristic) => {
         if (error || !characteristic?.value) return;
         this.onNotification(characteristic.value);
@@ -67,6 +79,7 @@ export class BleService {
       await this.manager.cancelDeviceConnection(this.device.id).catch(() => undefined);
       this.device = null;
     }
+    this.channel = null;
     this.responseBuffer = '';
     this.pending = null;
   }
@@ -76,8 +89,10 @@ export class BleService {
   }
 
   async sendCommand(command: string): Promise<string> {
-    if (!this.device) throw new Error('Not connected to an adapter.');
+    if (!this.device || !this.channel) throw new Error('Not connected to an adapter.');
     if (this.pending) throw new Error('A command is already in flight.');
+
+    const channel = this.channel;
 
     return new Promise<string>((resolve, reject) => {
       this.pending = { resolve, reject };
@@ -97,17 +112,23 @@ export class BleService {
       };
 
       const payload = Buffer.from(`${command}\r`, 'utf-8').toString('base64');
-      this.device!
-        .writeCharacteristicWithResponseForService(
-          OBD_BLE_UUIDS.service,
-          OBD_BLE_UUIDS.writeCharacteristic,
-          payload,
-        )
-        .catch((err) => {
-          clearTimeout(timeout);
-          this.pending = null;
-          reject(err instanceof Error ? err : new Error(String(err)));
-        });
+      const write = channel.writeWithResponse
+        ? this.device!.writeCharacteristicWithResponseForService(
+            channel.serviceUUID,
+            channel.writeCharacteristicUUID,
+            payload,
+          )
+        : this.device!.writeCharacteristicWithoutResponseForService(
+            channel.serviceUUID,
+            channel.writeCharacteristicUUID,
+            payload,
+          );
+
+      write.catch((err) => {
+        clearTimeout(timeout);
+        this.pending = null;
+        reject(err instanceof Error ? err : new Error(String(err)));
+      });
     });
   }
 
